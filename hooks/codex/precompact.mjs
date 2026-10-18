@@ -42,6 +42,8 @@ try {
   if (events.length > 0) {
     const stats = db.getSessionStats(sessionId);
     const snapshot = buildResumeSnapshot(events, {
+      maxBytes: 32 * 1024,
+      searchTool: "ctx_search",
       compactCount: (stats?.compact_count ?? 0) + 1,
     });
 

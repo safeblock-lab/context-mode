@@ -13,7 +13,6 @@ const toolNamer = createToolNamer("codex");
 const ROUTING_BLOCK = createRoutingBlock(toolNamer);
 import {
   writeSessionEventsFile,
-  buildSessionDirective,
   getSessionEvents,
 } from "../session-directive.mjs";
 import {
@@ -34,6 +33,7 @@ import { fileURLToPath } from "node:url";
 
 const HOOK_DIR = fileURLToPath(new URL(".", import.meta.url));
 const { loadSessionDB } = createSessionLoaders(HOOK_DIR);
+import { buildCodexRestoreContext } from "../codex-restore.bundle.mjs";
 const OPTS = CODEX_OPTS;
 
 let additionalContext = ROUTING_BLOCK;
@@ -86,11 +86,10 @@ try {
     // and before the resume.
     const events = sessionId ? getSessionEvents(db, sessionId) : [];
     if (events.length > 0) {
-      const eventMeta = writeSessionEventsFile(events, getSessionEventsPath(OPTS, projectDir));
-      additionalContext += buildSessionDirective(source, eventMeta, toolNamer);
+      writeSessionEventsFile(events, getSessionEventsPath(OPTS, projectDir));
     }
+    additionalContext = buildCodexRestoreContext(ROUTING_BLOCK, events, resumeSnapshot);
     if (resumeSnapshot) {
-      additionalContext += `\n\n${resumeSnapshot}`;
       db.markResumeConsumed(sessionId);
     }
 

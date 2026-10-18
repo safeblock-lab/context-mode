@@ -9,11 +9,11 @@
  * contains a natural summary plus a runnable search tool call that retrieves
  * full details from the indexed knowledge base on demand.
  *
- * Zero truncation. Zero information loss. Full data lives in SessionDB;
+ * Bounded inline summaries. Full data lives in SessionDB;
  * the snapshot is a table of contents.
  */
 
-import { escapeXML } from "../truncate.js";
+import { safeXML as escapeXML, safeXMLSnippet, prefix, packSnapshot } from "./restore-budget.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ export interface StoredEvent {
 }
 
 export interface BuildSnapshotOpts {
-  maxBytes?: number;      // KEPT for backward compat but IGNORED
+  maxBytes?: number;      // UTF-8 cap, clamped to 32 KiB; invalid values use default
   compactCount?: number;
   searchTool?: string;    // platform-specific tool name, default "ctx_search"
 }
@@ -55,8 +55,8 @@ function buildQueries(items: string[], maxQueries = 4): string[] {
  */
 function toolCall(toolName: string, queries: string[]): string {
   if (queries.length === 0) return "";
-  const escaped = queries.map(q => `"${escapeXML(q)}"`).join(", ");
-  return `\n    For full details:\n    ${escapeXML(toolName)}(\n      queries: [${escaped}],\n      source: "session-events"\n    )`;
+  const escaped = escapeXML(JSON.stringify(queries), 2048);
+  return `\n    For full details:\n    ${escapeXML(toolName)}(\n      queries: ${escaped},\n      source: "session-events"\n    )`;
 }
 
 // ── Section builders ─────────────────────────────────────────────────────────
@@ -117,12 +117,12 @@ function buildErrorsSection(errorEvents: StoredEvent[], searchTool: string): str
   const summaryLines: string[] = [];
   const queryTerms: string[] = [];
 
-  for (const ev of errorEvents) {
-    summaryLines.push(`    ${escapeXML(ev.data)}`);
+  for (const ev of errorEvents.slice(-4)) {
+    summaryLines.push(`    ${escapeXML(ev.data, 96)}`);
     queryTerms.push(ev.data);
   }
 
-  const queries = buildQueries(queryTerms);
+  const queries = buildQueries(queryTerms.slice(-2), 2);
   const lines = [
     `  <errors count="${errorEvents.length}">`,
     ...summaryLines,
@@ -218,7 +218,7 @@ function buildGitSection(gitEvents: StoredEvent[], searchTool: string): string {
  * TaskCreate events have `{ subject }`, TaskUpdate events have `{ taskId, status }`.
  * Match by chronological order: creates[0] -> lowest taskId from updates.
  */
-export function renderTaskState(taskEvents: StoredEvent[]): string {
+export function renderTaskState(taskEvents: StoredEvent[], concise = false): string {
   if (taskEvents.length === 0) return "";
 
   const creates: string[] = [];
@@ -242,12 +242,12 @@ export function renderTaskState(taskEvents: StoredEvent[]): string {
   // Match creates to updates positionally (creates[0] -> lowest taskId)
   const sortedIds = Object.keys(updates).sort((a, b) => Number(a) - Number(b));
 
-  const pending: string[] = [];
+  const pending: { subject: string; status: string }[] = [];
   for (let i = 0; i < creates.length; i++) {
     const matchedId = sortedIds[i];
     const status = matchedId ? (updates[matchedId] ?? "pending") : "pending";
     if (!DONE.has(status)) {
-      pending.push(creates[i]);
+      pending.push({ subject: creates[i], status });
     }
   }
 
@@ -255,14 +255,14 @@ export function renderTaskState(taskEvents: StoredEvent[]): string {
   if (pending.length === 0) return "";
 
   const lines: string[] = [];
-  for (const task of pending) {
-    lines.push(`    [pending] ${escapeXML(task)}`);
+  for (const task of pending.slice(concise ? -3 : -10)) {
+    lines.push(`    [${safeXMLSnippet(task.status, 32)}] ${concise ? safeXMLSnippet(task.subject, 96) : escapeXML(task.subject)}`);
   }
   return lines.join("\n");
 }
 
 function buildTaskSection(taskEvents: StoredEvent[], searchTool: string): string {
-  const taskContent = renderTaskState(taskEvents);
+  const taskContent = renderTaskState(taskEvents, true);
   if (!taskContent) return "";
 
   const queryTerms: string[] = [];
@@ -275,7 +275,8 @@ function buildTaskSection(taskEvents: StoredEvent[], searchTool: string): string
     } catch { /* not JSON */ }
   }
 
-  const queries = buildQueries(queryTerms);
+  // One short exact subject prefix remains a valid reference even when subjects are huge.
+  const queries = queryTerms.length ? [prefix(queryTerms[queryTerms.length - 1], 32)] : [];
   const pendingCount = taskContent.split("\n").length;
 
   const lines = [
@@ -403,7 +404,7 @@ function buildIntentSection(intentEvents: StoredEvent[]): string {
 }
 
 /**
- * Restore the most recent stated session goal verbatim. Placed at the top of
+ * Restore a bounded summary of the most recent stated session goal. Placed at the top of
  * the snapshot (right after how_to_search) so the resuming LLM reads the
  * active objective before anything else and keeps working toward it.
  */
@@ -413,7 +414,7 @@ function buildGoalSection(goalEvents: StoredEvent[]): string {
   return [
     `  <session_goal>`,
     `  The active objective for this session. Keep working toward it until it is met; do not ask the user to restate it.`,
-    `    ${escapeXML(lastGoal.data)}`,
+    `    ${safeXMLSnippet(lastGoal.data, 512)}`,
     `  </session_goal>`,
   ].join("\n");
 }
@@ -429,9 +430,13 @@ const RECENT_MESSAGES_LIMIT = 3;
 const RECENT_MESSAGE_MAX_CHARS = 400;
 
 function truncateForSnapshot(value: string, max: number): string {
-  const codepoints = [...value];
-  if (codepoints.length <= max) return value;
-  return codepoints.slice(0, max).join("");
+  let result = "";
+  let count = 0;
+  for (const char of value) {
+    if (count++ >= max) break;
+    result += char;
+  }
+  return result;
 }
 
 function buildRecentMessagesSection(userPromptEvents: StoredEvent[]): string {
@@ -467,14 +472,15 @@ function buildRecentMessagesSection(userPromptEvents: StoredEvent[]): string {
  * 1. Group events by category
  * 2. For each non-empty category, build a summary section with a runnable
  *    search tool call containing exact queries for full details
- * 3. Assemble ALL non-empty sections — no priority dropping, no byte budget
+ * 3. Pack whole sections by priority into the UTF-8 byte budget
  */
 export function buildResumeSnapshot(
   events: StoredEvent[],
   opts?: BuildSnapshotOpts,
 ): string {
   const compactCount = opts?.compactCount ?? 1;
-  const searchTool = opts?.searchTool ?? "ctx_search";
+  const searchTool = typeof opts?.searchTool === "string" && /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(opts.searchTool)
+    ? opts.searchTool : "ctx_search";
   const now = new Date().toISOString();
 
   // ── Group events by category ──
@@ -510,6 +516,10 @@ export function buildResumeSnapshot(
       case "role": roleEvents.push(ev); break;
       case "user-prompt": userPromptEvents.push(ev); break;
     }
+  }
+
+  for (const group of [ruleEvents, decisionEvents, envEvents, gitEvents, subagentEvents, skillEvents, roleEvents]) {
+    if (group.length > 10) group.splice(0, group.length - 10);
   }
 
   // ── Build all sections ──
@@ -565,13 +575,16 @@ export function buildResumeSnapshot(
   const recentMessages = buildRecentMessagesSection(userPromptEvents);
   if (recentMessages) sections.push(recentMessages);
 
-  // ── Assemble ──
-  const header = `<session_resume events="${events.length}" compact_count="${compactCount}" generated_at="${now}">`;
-  const footer = `</session_resume>`;
-
-  const body = sections.join("\n\n");
-  if (body) {
-    return `${header}\n\n${body}\n\n${footer}`;
-  }
-  return `${header}\n${footer}`;
+  // Reserve objective and active state before lower-priority history.
+  const priority = ["how_to_search", "session_goal", "task_state", "intent", "recent_user_messages", "files", "errors"];
+  const ranked = [...sections].sort((a, b) => {
+    const rank = (section: string) => {
+      const index = priority.findIndex(tag => section.trimStart().startsWith(`<${tag}`));
+      return index < 0 ? priority.length : index;
+    };
+    return rank(a) - rank(b);
+  });
+  const count = Number.isSafeInteger(compactCount) && compactCount >= 0 ? compactCount : 1;
+  return packSnapshot(ranked, opts?.maxBytes,
+    ` events="${events.length}" compact_count="${count}" generated_at="${now}"`);
 }
